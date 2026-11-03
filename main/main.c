@@ -1,279 +1,262 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
+// main/main.c —— FoloToy AI Passport 应用入口:BLE 信号扫描器。
 //
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
-#include "bsp_audio.h"
+// 这是一个"衍生应用",不是基线硬件测试示例:
+//   * 启动后直接进入重新设计的深色扫描界面(列表页 + 设备详情页);
+//   * 不进入 main/demo_*.c 的测试菜单,也不使用 main/ui_pixel.* 的演示外壳;
+//   * 硬件能力(BSP)复用,应用状态、任务与页面都在本文件/ble_scan_ui.c 里。
+//
+// 按键语义:
+//   上/下 短按   列表:移动选中项;详情:切换上/下一台设备
+//   确定  短按   列表:进入设备详情;详情:返回列表
+//   确定  长按   列表:暂停/恢复扫描;详情:返回列表
+//
+// 任务与所有权:
+//   * NimBLE host 任务由 ble_scan.c 创建并回收;
+//   * 按键回调运行在 button 组件的 esp_timer 任务,只入队;
+//   * s_input_task 负责把按键事件交给 UI(UI 自己加 LVGL 锁);
+//   * s_power_task 每秒检查空闲时间:30 秒把背光降到 15%,120 秒关屏并暂停扫描
+//     (记下"自动暂停"),任意按键恢复全亮并恢复扫描;电量每 5 秒在锁外读一次。
+#include "ble_client.h"
+#include "ble_scan.h"
+#include "ble_scan_ui.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
+#include "bsp_pins.h"
 #include "key_guard.h"
-#include "ui_pixel.h"
-#include "lvgl.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-static const char *TAG = "main";
+static const char *TAG = "ble_scanner";
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-};
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
-#define INPUT_QUEUE_DEPTH 8
+#define INPUT_QUEUE_DEPTH       8
+#define BUTTON_TASK_STACK       4096
+#define BUTTON_TASK_PRIORITY    5
+#define POWER_TASK_STACK        3072
+#define POWER_TASK_PRIORITY     3
+#define IDLE_DIM_AFTER_MS       30000
+// 屏幕全关后继续扫描没有意义:关屏同时暂停扫描,按键唤醒时自动恢复。
+#define IDLE_SCREEN_OFF_AFTER_MS 120000
+#define BACKLIGHT_FULL          100
+#define BACKLIGHT_DIM           15
+#define BACKLIGHT_OFF           0
+#define UI_LOCK_TIMEOUT_MS      1000
 
 typedef struct {
     bsp_btn_t btn;
-    bsp_btn_ev_t event;
+    bsp_btn_ev_t ev;
 } input_event_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
-
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
 static QueueHandle_t s_input_queue;
 static TaskHandle_t s_input_task;
+static TaskHandle_t s_power_task;
 static volatile bool s_input_ready;
-
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
-    }
-}
-
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
-
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
-    }
-
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
-
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
-}
-
-static void enter_menu(void) {
-    menu_build();
-}
-
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
-}
-
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
-
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
-            }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
-        }
-        return;
-    }
-
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
-        bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
-        }
-        return;
-    }
-    bsp_lvgl_unlock();
-}
-
-static void input_task(void *arg) {
-    (void)arg;
-    input_event_t input;
-    for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            process_input(&input);
-        }
-    }
-}
-
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// Waking from deep sleep by key reboots the chip while that key is still held: the
-// button component starts a few hundred milliseconds later, registers a press that
-// is already down, and grades it a long press once it has been down for its
-// threshold (500 ms here), so an unintended action fires almost immediately. Drop
-// key actions until that press comes up; the deadline is only a safety net so a
-// stuck key cannot leave the pad dead. The state machine lives in key_guard.h so it
-// can be unit-tested without the rest of the demo.
-#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
+static volatile uint32_t s_last_input_ms;
+static volatile bool s_dimmed;
+static volatile bool s_screen_off;
+// 因空闲而自动暂停扫描;用户按键后需要自动恢复(手动暂停不受影响)。
+static volatile bool s_auto_paused;
+// 深睡按键唤醒守卫。本应用暂不主动进入 deep sleep,所以它通常保持撤防;
+// 但按键分发路径保留与基线主程序一致的消费顺序:将来若加入醒睡,唤醒键的
+// release 不会被输入任务未就绪的早退吞掉(见 main/key_guard.h)。
 static key_guard_t s_key_guard;
 
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// 把背光恢复成全亮并记录本次输入时间。可从任意任务调用:bsp_display_backlight()
+// 只操作 LEDC,不触碰 LVGL。
+static void note_user_activity(void)
+{
+    s_last_input_ms = now_ms();
+    if (s_dimmed || s_screen_off) {
+        s_dimmed = false;
+        s_screen_off = false;
+        bsp_display_backlight(BACKLIGHT_FULL);
+    }
+}
+
+// 按键回调运行在 button 组件的共享 esp_timer 任务:只做背光恢复与入队,
+// 不做任何阻塞操作。
+static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
+{
     (void)user;
-    // Consume the guard before the readiness check: a release can arrive after the
-    // post-init voltage sample but before input dispatch is ready, and dropping it
-    // here would leave the guard armed to swallow the next real press.
+    const bool was_screen_off = s_screen_off;
+    note_user_activity();
+
+    // 关屏期间只按下(还没形成点击)也要唤醒输入任务,好让它恢复被自动暂停的扫描;
+    // 这个 PRESS 事件不会转成 UI 动作(UI 只处理 CLICK/LONG)。
+    if (was_screen_off && ev == BSP_BTN_PRESS && s_input_ready && s_input_queue != NULL) {
+        const input_event_t wake = { .btn = btn, .ev = ev };
+        (void)xQueueSend(s_input_queue, &wake, 0);
+    }
+
+    // 守卫必须先于输入任务就绪检查消费:唤醒键的 release 可能早于 s_input_ready,
+    // 若被早退丢弃,守卫将一直拦到 deadline 兜底。
     const bool was_armed = s_key_guard.armed;
     if (key_guard_consume(&s_key_guard, ev == BSP_BTN_RELEASE, esp_timer_get_time())) {
-        // The release and the deadline both arrive on this task; log the disarm
-        // transition once it happens.
         if (was_armed && !s_key_guard.armed) {
             ESP_LOGI(TAG, "唤醒键已松手,按键恢复响应");
         }
         return;
     }
-    if (!s_input_ready || !s_input_queue) return;
-    const input_event_t input = { .btn = btn, .event = ev };
+
+    if (ev != BSP_BTN_CLICK && ev != BSP_BTN_LONG) return;
+    if (!s_input_ready || s_input_queue == NULL) return;
+    const input_event_t input = { .btn = btn, .ev = ev };
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
-    const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
-    if (wake_causes & ~(1u << ESP_SLEEP_WAKEUP_UNDEFINED)) {
-        ESP_LOGI(TAG, "休眠唤醒原因位图: 0x%02x", (unsigned)wake_causes);
+static void input_task(void *arg)
+{
+    (void)arg;
+    input_event_t input;
+    for (;;) {
+        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) != pdTRUE) continue;
+        s_last_input_ms = now_ms();
+        bool just_resumed = false;
+        if (s_auto_paused) {
+            s_auto_paused = false;
+            if (ble_scan_state() == BLE_SCAN_PAUSED) {
+                const esp_err_t err = ble_scan_resume();
+                if (err != ESP_OK) ESP_LOGW(TAG, "唤醒后恢复扫描失败: %s", esp_err_to_name(err));
+            }
+            just_resumed = true;
+        }
+        if (input.ev != BSP_BTN_CLICK && input.ev != BSP_BTN_LONG) continue;  // 唤醒用的 PRESS
+        // 用户用长按唤醒了屏幕:这一次 LONG 已经用于"恢复扫描",不要再把它当成
+        // 列表页的"暂停"手势,否则会出现唤醒后立刻又暂停的怪异行为。
+        if (just_resumed && input.ev == BSP_BTN_LONG) continue;
+        ble_scan_ui_handle_key(input.btn, input.ev);
     }
-    // 按键唤醒时,那颗键在整个启动期间还按着。先挡住它的动作(见 on_key)。
-    if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
-        key_guard_arm(&s_key_guard, esp_timer_get_time(), KEY_GUARD_MAX_US);
-        ESP_LOGI(TAG, "按键唤醒:先屏蔽按键动作,直到那颗键松手");
+}
+
+// 低功耗与电量:屏幕是这台设备最耗电的部分。连续 30 秒没有按键时把背光降到
+// 15%,扫描继续在后台进行;任意按键立即恢复全亮。电量每 5 秒在 LVGL 锁之外
+// 读一次并推送给界面,避免电池芯片的 I2C 读把 LVGL 锁持有时间拉长。
+#define BATTERY_READ_TICKS 5
+static void power_task(void *arg)
+{
+    (void)arg;
+    uint32_t battery_ticks = BATTERY_READ_TICKS;  // 首次循环立即读一次
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (++battery_ticks >= BATTERY_READ_TICKS) {
+            battery_ticks = 0;
+            ble_scan_ui_set_battery(bsp_battery_soc());
+        }
+        if (s_screen_off) {
+            // 关屏瞬间 BLE 可能还在 STARTING,稍后才真正开扫:这里补一次暂停,
+            // 避免出现"屏幕已关、扫描却一直在跑"的耗电状态。
+            if (ble_scan_state() == BLE_SCAN_SCANNING && ble_scan_pause() == ESP_OK) {
+                s_auto_paused = true;
+            }
+            continue;
+        }
+        const uint32_t idle_ms = (uint32_t)(now_ms() - s_last_input_ms);
+        if (idle_ms >= IDLE_SCREEN_OFF_AFTER_MS) {
+            // 关屏省电;同时把扫描停掉(如果正在扫描),按键唤醒后自动恢复。
+            if (ble_scan_state() == BLE_SCAN_SCANNING) {
+                if (ble_scan_pause() == ESP_OK) s_auto_paused = true;
+            }
+            s_screen_off = true;
+            s_dimmed = true;
+            bsp_display_backlight(BACKLIGHT_OFF);
+            ESP_LOGI(TAG, "空闲 %d s,关屏并暂停扫描", IDLE_SCREEN_OFF_AFTER_MS / 1000);
+        } else if (!s_dimmed && idle_ms >= IDLE_DIM_AFTER_MS) {
+            s_dimmed = true;
+            bsp_display_backlight(BACKLIGHT_DIM);
+            ESP_LOGI(TAG, "空闲 %d s,背光降到 %d%%", IDLE_DIM_AFTER_MS / 1000, BACKLIGHT_DIM);
+        }
     }
+}
+
+static esp_err_t input_start(void)
+{
+    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
+    if (s_input_queue == NULL) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(input_task, "app_input", BUTTON_TASK_STACK, NULL,
+                    BUTTON_TASK_PRIORITY, &s_input_task) != pdPASS) {
+        vQueueDelete(s_input_queue);
+        s_input_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    s_input_ready = true;
+    const esp_err_t err = bsp_button_init(on_key, NULL);
+    if (err != ESP_OK) {
+        s_input_ready = false;
+        vTaskDelete(s_input_task);
+        s_input_task = NULL;
+        vQueueDelete(s_input_queue);
+        s_input_queue = NULL;
+        return err;
+    }
+    return ESP_OK;
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "FoloToy AI Passport BLE 信号扫描器启动");
 
     bsp_i2c_init();
     bsp_i2c_scan();
 
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
-    if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
+    if (bsp_display_init() != ESP_OK || bsp_lvgl_init() == NULL) {
+        ESP_LOGE(TAG, "显示/LVGL 初始化失败,应用无法继续。"
                       "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
         return;
     }
-    bsp_display_backlight(100);
+    bsp_display_backlight(BACKLIGHT_FULL);
+    s_last_input_ms = now_ms();
 
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
+    // 电量计失败不阻塞扫描功能:UI 上显示 "--"。
+    const esp_err_t battery_err = bsp_battery_init();
+    if (battery_err != ESP_OK) {
+        ESP_LOGW(TAG, "电量计初始化失败: %s(UI 显示 --)", esp_err_to_name(battery_err));
+    }
 
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
+    const esp_err_t input_err = input_start();
     if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
-    } else if (s_key_guard.armed) {
-        // 若唤醒键在按键驱动启动前就已松手,组件不会产生 release 事件,守卫会一直
-        // 拦到兜底。初始化完成后按真实电压同步一次:已松手立即撤防。
-        const bool released = bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN;
-        key_guard_sync_released(&s_key_guard, released);
-        if (!s_key_guard.armed) {
-            ESP_LOGI(TAG, "唤醒键在按键驱动启动前已松手,提前撤防");
+        ESP_LOGE(TAG, "按键/输入任务初始化失败: %s", esp_err_to_name(input_err));
+    }
+
+    // UI 只在创建时持锁;之后由 LVGL 定时器与按键任务各自加锁。
+    if (!bsp_lvgl_lock(UI_LOCK_TIMEOUT_MS)) {
+        ESP_LOGE(TAG, "获取 LVGL 锁失败,无法创建界面");
+        return;
+    }
+    ble_scan_ui_create();
+    bsp_lvgl_unlock();
+
+    // 蓝牙失败时 UI 会显示失败状态,应用本身仍可运行。
+    const esp_err_t ble_err = ble_scan_start();
+    if (ble_err != ESP_OK) {
+        ESP_LOGE(TAG, "BLE 扫描启动失败: %s", esp_err_to_name(ble_err));
+    } else {
+        // 只读设备信息客户端(central GATT)依赖同一个 NimBLE host;任务常驻,
+        // 只在用户从设备详情页发起读取时工作。
+        const esp_err_t client_err = ble_client_start();
+        if (client_err != ESP_OK) {
+            ESP_LOGW(TAG, "设备信息读取客户端启动失败: %s", esp_err_to_name(client_err));
         }
     }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
 
-    if (bsp_lvgl_lock(1000)) {
-        enter_menu();
-        bsp_lvgl_unlock();
-        s_input_ready = true;
+    if (xTaskCreate(power_task, "app_power", POWER_TASK_STACK, NULL,
+                    POWER_TASK_PRIORITY, &s_power_task) != pdPASS) {
+        ESP_LOGW(TAG, "低功耗任务创建失败,屏幕保持常亮");
     }
 
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    // 本板无 PSRAM:记录启动后的空闲堆与最大连续块,便于真机评估新增的
+    // BLE central + SEEKER 分包缓冲(约 21KB 静态)与 32KB LVGL 池是否够用。
+    ESP_LOGI(TAG, "BLE 信号扫描器已就绪;free heap=%u largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }

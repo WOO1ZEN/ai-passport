@@ -15,6 +15,10 @@
 - 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。
 - 不提交许可不允许分发的字库。
 
+| 文件 | 格式与大小 | 用途与来源 |
+| --- | --- | --- |
+| [`fonts/app_font_16.c`](fonts/app_font_16.c) | LVGL 9.5 静态位图字体，16 px、4 bpp、PLAIN，覆盖 ASCII + 117 个中文字符，约 104 KB | BLE 信号扫描应用唯一使用的界面字体。由固定依赖 `lvgl/lvgl` 9.5.0 自带的思源黑体 Source Han Sans SC Normal（SIL OFL 1.1）经 `lv_font_conv` 1.5.3（Node.js 18）转换生成。用 `tools/gen_app_font.sh` 重新生成；字符清单见 [`fonts/app_font_16.chars`](fonts/app_font_16.chars)，覆盖检查见 `tests/test_app_font_coverage.py`，完整记录见 [`fonts/README.zh_CN.md`](fonts/README.zh_CN.md)。 |
+
 ## 图片（images）
 
 可复用的源图与生成的显示资产放在 `images/`。

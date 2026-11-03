@@ -35,6 +35,32 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_key_guard.c -o "${test_dir}/test_key_guard"
     "${test_dir}/test_key_guard"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_ble_scan_model.c main/ble_scan_model.c \
+        -o "${test_dir}/test_ble_scan_model"
+    "${test_dir}/test_ble_scan_model"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_md5.c main/md5.c \
+        -o "${test_dir}/test_md5"
+    "${test_dir}/test_md5"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_nova_proto.c main/nova_proto.c main/device_proto.c main/md5.c \
+        -o "${test_dir}/test_nova_proto"
+    "${test_dir}/test_nova_proto"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_seeker_proto.c main/seeker_proto.c main/md5.c \
+        -o "${test_dir}/test_seeker_proto"
+    "${test_dir}/test_seeker_proto"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_framed_proto.c main/framed_proto.c main/nova_proto.c main/md5.c \
+        main/device_proto.c \
+        -o "${test_dir}/test_framed_proto"
+    "${test_dir}/test_framed_proto"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_aura_proto.c main/aura_proto.c main/framed_proto.c \
+        main/nova_proto.c main/md5.c main/device_proto.c \
+        -o "${test_dir}/test_aura_proto"
+    "${test_dir}/test_aura_proto"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"
@@ -68,6 +94,20 @@ run_static_checks() {
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/scan_stubs -Imain \
+        tests/test_ble_scan_runtime.c \
+        -o "${test_dir}/test_ble_scan_runtime"
+    "${test_dir}/test_ble_scan_runtime"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/scan_stubs -Imain \
+        tests/test_ble_client_runtime.c tests/scan_stubs/fake_scan.c \
+        main/ble_scan_model.c main/md5.c main/device_proto.c main/nova_proto.c \
+        main/seeker_proto.c main/framed_proto.c main/aura_proto.c \
+        main/ble_client.c \
+        -o "${test_dir}/test_ble_client_runtime"
+    "${test_dir}/test_ble_client_runtime"
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_app_font_coverage.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py

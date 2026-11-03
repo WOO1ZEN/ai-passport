@@ -24,21 +24,36 @@ CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_DEF_REFR_PERIOD=20
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
-# LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
-CONFIG_LV_MEM_SIZE_KILOBYTES=24
+# UI 文案是 UTF-8;应用自带的点阵字体子集也依赖 UTF-8 解码,故显式打开该选项。
+CONFIG_LV_TXT_ENC_UTF8=y
+# LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享。本应用两张屏幕
+# 约 65 个控件、并给部分控件设置局部样式,24KB 偏紧;32KB 比 24KB 多占 8KB 静态
+# RAM(本板无 PSRAM,这个代价必须明确),换取更稳的刷新与足够的样式开销。
+CONFIG_LV_MEM_SIZE_KILOBYTES=32
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
 # --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
+# ESP32-C3 仅支持 BLE。应用同时需要两种角色:
+#   * observer(ROLE_OBSERVER):扫描周围设备(main/ble_scan.c);
+#   * central(ROLE_CENTRAL):用户长按详情页时主动连接并只读 GATT 信息
+#     (main/ble_client.c,支持 NOVA / SEEKER)。
+# 本应用不广播、不提供 GATT 服务,所以 peripheral / broadcaster 关闭;一次只连接
+# 一台被读取设备,MAX_CONNECTIONS=1 足够。
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# ATT 首选 MTU 256:只读请求(SEEKER 的 JSON / NOVA 的 32B 私钥)都能一次写完,
+# 也保证 notify 单包能装下 SEEKER 的 22B 头 + 正文。
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
 CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
 CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# 只读会话不做 BLE 层配对/加密:NOVA 是应用层 0x07/0x08 认证,SEEKER 是 JSON
+# token;SMP 用不到,关闭可省 Flash/RAM(该设置在只扫描阶段已验证可链接,加入
+# central 后继续保留)。
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n

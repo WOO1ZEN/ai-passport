@@ -17,6 +17,10 @@ Store reusable font files and generated font sources in `fonts/`.
 - Check Flash and internal-RAM impact before adding a font; the ESP32-C3 has no PSRAM.
 - Do not commit fonts whose license does not permit redistribution.
 
+| File | Format and size | Use and source |
+| --- | --- | --- |
+| [`fonts/app_font_16.c`](fonts/app_font_16.c) | LVGL 9.5 static bitmap font, 16 px, 4 bpp, plain, ASCII + 117 CJK code points, ~104 KB | Single UI font for the BLE signal scanner application. Generated with `lv_font_conv` 1.5.3 (Node.js 18) from Source Han Sans SC Normal (SIL OFL 1.1) shipped by the pinned `lvgl/lvgl` 9.5.0 dependency. Regenerate with `tools/gen_app_font.sh`; the inventory is [`fonts/app_font_16.chars`](fonts/app_font_16.chars), coverage is checked by `tests/test_app_font_coverage.py`, and the full record is in [`fonts/README.md`](fonts/README.md). |
+
 ## Images
 
 Store reusable source images and generated display assets in `images/`.
